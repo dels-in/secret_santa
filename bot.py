@@ -2,7 +2,7 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -11,15 +11,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select, update, delete
+from sqlalchemy import select, update, delete, func, and_, or_
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
 from config import BOT_TOKEN, ADMIN_ID, TIMEZONE
-# Вместо сложных импортов используйте только базовые модели
-from database_fixed import get_async_db, User, Event, DrawResult, Group, user_group_association, generate_invite_code
-
+from database import get_db_session, User, Event, DrawResult, Group, user_group_association
+from database import generate_invite_code, InviteCode, ExclusionRule
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -32,21 +31,30 @@ dp = Dispatcher(storage=storage)
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 
-# States for FSM
+# ==================== STATES ====================
+
 class RegistrationStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_wishlist = State()
-    waiting_for_group_selection = State()
+
+
+class GroupStates(StatesGroup):
+    creating_group_name = State()
+    creating_group_description = State()
+    joining_group = State()
+    managing_group = State()
 
 
 class AdminStates(StatesGroup):
     setting_start_date = State()
     setting_end_date = State()
     sending_broadcast = State()
+    manual_pair_selection = State()
 
 
-class MessageStates(StatesGroup):
-    waiting_for_anonymous_message = State()
+class UserStates(StatesGroup):
+    editing_profile = State()
+    editing_wishlist = State()
 
 
 # ==================== HELPER FUNCTIONS ====================
@@ -55,6 +63,14 @@ async def get_user(session: AsyncSession, telegram_id: int) -> Optional[User]:
     """Get user by telegram ID"""
     result = await session.execute(
         select(User).where(User.telegram_id == telegram_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_group(session: AsyncSession, group_id: int) -> Optional[Group]:
+    """Get group by ID"""
+    result = await session.execute(
+        select(Group).where(Group.id == group_id)
     )
     return result.scalar_one_or_none()
 
@@ -80,34 +96,40 @@ def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 
-async def notify_admins(message: str):
-    """Send notification to all admins"""
-    async with get_async_db() as session:
-        result = await session.execute(
-            select(User).where(User.is_admin == True)
+async def user_in_group(session: AsyncSession, user_id: int, group_id: int) -> bool:
+    """Check if user is in group"""
+    result = await session.execute(
+        select(user_group_association).where(
+            user_group_association.c.user_id == user_id,
+            user_group_association.c.group_id == group_id
         )
-        admins = result.scalars().all()
+    )
+    return result.first() is not None
 
-        for admin in admins:
-            try:
-                await bot.send_message(chat_id=admin.telegram_id, text=message)
-            except Exception as e:
-                logger.error(f"Failed to notify admin {admin.telegram_id}: {e}")
+
+async def get_user_groups(session: AsyncSession, user_id: int) -> List[Group]:
+    """Get all groups where user is a member"""
+    result = await session.execute(
+        select(Group).join(
+            user_group_association, Group.id == user_group_association.c.group_id
+        ).where(user_group_association.c.user_id == user_id)
+    )
+    return result.scalars().all()
 
 
 # ==================== USER COMMANDS ====================
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    """Start command - main menu"""
-    async with get_async_db() as session:
+    """Start command - registration or main menu"""
+    async with get_db_session() as session:
         user = await get_user(session, message.from_user.id)
 
         if user:
-            # User already registered
+            # User already registered - show main menu
             keyboard = InlineKeyboardBuilder()
-            keyboard.button(text="📋 Профиль", callback_data="profile")
-            keyboard.button(text="👥 Группы", callback_data="groups")
+            keyboard.button(text="📋 Мой профиль", callback_data="profile")
+            keyboard.button(text="👥 Мои группы", callback_data="my_groups")
             keyboard.button(text="🎮 Активная игра", callback_data="active_game")
 
             if is_admin(message.from_user.id):
@@ -146,7 +168,7 @@ async def process_wishlist(message: types.Message, state: FSMContext):
     """Process user's wishlist and complete registration"""
     user_data = await state.get_data()
 
-    async with get_async_db() as session:
+    async with get_db_session() as session:
         # Check if user already exists
         existing_user = await get_user(session, message.from_user.id)
         if existing_user:
@@ -166,61 +188,27 @@ async def process_wishlist(message: types.Message, state: FSMContext):
 
         session.add(new_user)
         await session.commit()
-        await session.refresh(new_user)
-
-        # Create default group for the user
-        default_group = Group(
-            name="Моя первая группа",
-            description=f"Группа для {new_user.full_name}",
-            invite_code=generate_invite_code(),
-            creator_id=new_user.id
-        )
-        session.add(default_group)
-        await session.commit()
-        await session.refresh(default_group)
-
-        # Add user to the group
-        stmt = UserGroupAssociation.insert().values(
-            user_id=new_user.id,
-            group_id=default_group.id
-        )
-        await session.execute(stmt)
-
-        # Create default event for the group
-        default_event = Event(
-            name="Тайный Санта",
-            group_id=default_group.id,
-            status='waiting'
-        )
-        session.add(default_event)
-        await session.commit()
 
         await message.answer(
             f"✅ Регистрация успешно завершена!\n\n"
             f"Ваше имя: {user_data['full_name']}\n"
             f"Ваши пожелания сохранены.\n\n"
-            f"Создана ваша первая группа:\n"
-            f"Название: {default_group.name}\n"
-            f"Код приглашения: `{default_group.invite_code}`\n\n"
-            f"Используйте /groups для управления группами.",
-            parse_mode="Markdown"
-        )
-
-        # Notify admin
-        await notify_admins(
-            f"👤 Новый пользователь зарегистрирован:\n"
-            f"• Имя: {new_user.full_name}\n"
-            f"• Telegram: @{new_user.username if new_user.username else 'без username'}\n"
-            f"• Всего пользователей: {await session.scalar(select(func.count()).select_from(User))}"
+            f"Теперь создайте свою первую группу или присоединитесь к существующей."
         )
 
     await state.clear()
 
+    # Show group creation options
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="📦 Создать группу", callback_data="create_group_init")
+    keyboard.button(text="🔗 Присоединиться к группе", callback_data="join_group_init")
+    await message.answer("Выберите действие:", reply_markup=keyboard.as_markup())
+
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: types.Message):
-    """Show user profile"""
-    async with get_async_db() as session:
+    """Show user profile with edit options"""
+    async with get_db_session() as session:
         user = await get_user(session, message.from_user.id)
 
         if not user:
@@ -228,12 +216,7 @@ async def cmd_profile(message: types.Message):
             return
 
         # Get user's groups
-        result = await session.execute(
-            select(Group).join(
-                UserGroupAssociation, Group.id == UserGroupAssociation.c.group_id
-            ).where(UserGroupAssociation.c.user_id == user.id)
-        )
-        groups = result.scalars().all()
+        groups = await get_user_groups(session, user.id)
 
         response = f"👤 **Ваш профиль**\n\n"
         response += f"• Имя: {user.full_name}\n"
@@ -244,33 +227,339 @@ async def cmd_profile(message: types.Message):
         if is_admin(message.from_user.id):
             response += f"• 👑 Статус: Администратор\n"
 
-        # Check active events
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(text="✏️ Изменить ФИО", callback_data="edit_name")
+        keyboard.button(text="🎁 Изменить пожелания", callback_data="edit_wishlist")
+        keyboard.button(text="📱 Добавить контакты", callback_data="add_contacts")
+        keyboard.adjust(2)
+
+        await message.answer(response, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+
+
+# ==================== GROUP MANAGEMENT ====================
+
+@dp.callback_query(F.data == "create_group_init")
+async def create_group_init(callback: types.CallbackQuery, state: FSMContext):
+    """Start group creation process"""
+    await callback.message.answer(
+        "📦 **Создание новой группы**\n\n"
+        "Введите название для группы (максимум 100 символов):",
+        parse_mode="Markdown"
+    )
+    await state.set_state(GroupStates.creating_group_name)
+    await callback.answer()
+
+
+@dp.message(GroupStates.creating_group_name)
+async def process_group_name(message: types.Message, state: FSMContext):
+    """Process group name"""
+    if len(message.text) > 100:
+        await message.answer("❌ Слишком длинное название. Максимум 100 символов.")
+        return
+
+    await state.update_data(group_name=message.text)
+    await message.answer(
+        "📝 Введите описание группы (необязательно, можно пропустить, отправив '-'):"
+    )
+    await state.set_state(GroupStates.creating_group_description)
+
+
+@dp.message(GroupStates.creating_group_description)
+async def process_group_description(message: types.Message, state: FSMContext):
+    """Process group description and create group"""
+    user_data = await state.get_data()
+    description = None if message.text == '-' else message.text
+
+    async with get_db_session() as session:
+        user = await get_user(session, message.from_user.id)
+        if not user:
+            await message.answer("❌ Ошибка: пользователь не найден")
+            await state.clear()
+            return
+
+        # Check group limit
+        user_groups = await get_user_groups(session, user.id)
+        if len(user_groups) >= 5:  # Limit to 5 groups per user
+            await message.answer("❌ Вы достигли лимита групп (5 групп на пользователя)")
+            await state.clear()
+            return
+
+        # Create group
+        new_group = Group(
+            name=user_data['group_name'],
+            description=description,
+            invite_code=generate_invite_code(),
+            creator_id=user.id
+        )
+        session.add(new_group)
+        await session.commit()
+        await session.refresh(new_group)
+
+        # Add creator to group
+        stmt = user_group_association.insert().values(
+            user_id=user.id,
+            group_id=new_group.id
+        )
+        await session.execute(stmt)
+
+        # Create default event for the group
+        default_event = Event(
+            name="Тайный Санта",
+            group_id=new_group.id,
+            status='waiting'
+        )
+        session.add(default_event)
+        await session.commit()
+
+        # Create invite code
+        invite = InviteCode(
+            code=new_group.invite_code,
+            group_id=new_group.id,
+            created_by=user.id,
+            max_uses=50,
+            expires_at=datetime.now(pytz.timezone(TIMEZONE)) + timedelta(days=30)
+        )
+        session.add(invite)
+        await session.commit()
+
+        await message.answer(
+            f"✅ Группа *{new_group.name}* создана!\n\n"
+            f"📋 **Информация:**\n"
+            f"• Код приглашения: `{new_group.invite_code}`\n"
+            f"• Участников: 1\n"
+            f"• Статус: Открыта для регистрации\n\n"
+            f"📢 **Пригласите друзей:**\n"
+            f"Отправьте им код: `{new_group.invite_code}`\n"
+            f"Или используйте команду:\n"
+            f"`/join {new_group.invite_code}`",
+            parse_mode="Markdown"
+        )
+
+    await state.clear()
+
+
+@dp.callback_query(F.data == "join_group_init")
+async def join_group_init(callback: types.CallbackQuery, state: FSMContext):
+    """Start group joining process"""
+    await callback.message.answer(
+        "🔗 **Присоединение к группе**\n\n"
+        "Введите код приглашения:",
+        parse_mode="Markdown"
+    )
+    await state.set_state(GroupStates.joining_group)
+    await callback.answer()
+
+
+@dp.message(GroupStates.joining_group)
+async def process_join_group(message: types.Message, state: FSMContext):
+    """Process group joining"""
+    invite_code = message.text.upper().strip()
+
+    async with get_db_session() as session:
+        # Find group by invite code
+        result = await session.execute(
+            select(Group).where(Group.invite_code == invite_code)
+        )
+        group = result.scalar_one_or_none()
+
+        if not group:
+            await message.answer("❌ Группа с таким кодом не найдена")
+            await state.clear()
+            return
+
+        if not group.registration_open:
+            await message.answer("❌ Регистрация в этой группе закрыта")
+            await state.clear()
+            return
+
+        # Check if user is already in group
+        user = await get_user(session, message.from_user.id)
+        if not user:
+            await message.answer("❌ Сначала зарегистрируйтесь через /start")
+            await state.clear()
+            return
+
+        if await user_in_group(session, user.id, group.id):
+            await message.answer("❌ Вы уже состоите в этой группе")
+            await state.clear()
+            return
+
+        # Check group capacity
+        result = await session.execute(
+            select(func.count()).select_from(
+                user_group_association
+            ).where(user_group_association.c.group_id == group.id)
+        )
+        member_count = result.scalar()
+
+        if member_count >= group.max_participants:
+            await message.answer("❌ Группа заполнена")
+            await state.clear()
+            return
+
+        # Add user to group
+        stmt = user_group_association.insert().values(
+            user_id=user.id,
+            group_id=group.id
+        )
+        await session.execute(stmt)
+
+        # Update invite code usage
+        result = await session.execute(
+            select(InviteCode).where(InviteCode.code == invite_code)
+        )
+        invite = result.scalar_one_or_none()
+        if invite:
+            invite.used_count += 1
+            if invite.used_count >= invite.max_uses:
+                invite.is_active = False
+
+        await session.commit()
+
+        await message.answer(
+            f"✅ Вы присоединились к группе *{group.name}*!\n\n"
+            f"📋 **Информация:**\n"
+            f"• Участников: {member_count + 1}\n"
+            f"• Организатор: {group.creator.full_name}\n"
+            f"• Описание: {group.description if group.description else 'нет'}\n\n"
+            f"Используйте /my_groups для просмотра ваших групп.",
+            parse_mode="Markdown"
+        )
+
+    await state.clear()
+
+
+@dp.message(Command("join"))
+async def cmd_join(message: types.Message):
+    """Join group via command with invite code"""
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: `/join КОД_ПРИГЛАШЕНИЯ`", parse_mode="Markdown")
+        return
+
+    invite_code = args[1].upper().strip()
+    await process_join_group(message, None)  # Используем ту же функцию
+
+
+@dp.message(Command("my_groups"))
+async def cmd_my_groups(message: types.Message):
+    """Show user's groups"""
+    async with get_db_session() as session:
+        user = await get_user(session, message.from_user.id)
+
+        if not user:
+            await message.answer("Сначала зарегистрируйтесь через /start")
+            return
+
+        groups = await get_user_groups(session, user.id)
+
+        if not groups:
+            await message.answer(
+                "📋 **У вас пока нет групп**\n\n"
+                "Создайте свою группу или присоединитесь к существующей:\n"
+                "• /create_group - создать новую группу\n"
+                "• /join КОД - присоединиться по коду",
+                parse_mode="Markdown"
+            )
+            return
+
+        response = "📋 **Ваши группы:**\n\n"
+        keyboard = InlineKeyboardBuilder()
+
         for group in groups:
+            # Count members
+            result = await session.execute(
+                select(func.count()).select_from(
+                    user_group_association
+                ).where(user_group_association.c.group_id == group.id)
+            )
+            member_count = result.scalar()
+
+            # Get active event
             event = await get_active_event(session, group.id)
+
+            response += f"🎮 *{group.name}*\n"
+            response += f"   👥 Участников: {member_count}\n"
+            response += f"   🔑 Код: `{group.invite_code}`\n"
             if event:
-                # Check if user has a draw result
-                result = await session.execute(
-                    select(DrawResult).where(
-                        DrawResult.event_id == event.id,
-                        DrawResult.santa_id == user.id
-                    )
-                )
-                draw_result = result.scalar_one_or_none()
+                status_emoji = "🟢" if event.status == 'active' else "🟡"
+                response += f"   {status_emoji} Статус: {event.status}\n"
+            response += "\n"
 
-                if draw_result:
-                    receiver = await session.get(User, draw_result.receiver_id)
-                    response += f"\n🎁 **В группе '{group.name}':**\n"
-                    response += f"Вы - Тайный Санта для: {receiver.full_name}\n"
-                    response += f"Пожелания: {receiver.wishlist[:100]}...\n"
+            # Add button for group management
+            keyboard.button(text=f"👥 {group.name}", callback_data=f"group_{group.id}")
 
-                    keyboard = InlineKeyboardBuilder()
-                    keyboard.button(text="✅ Подарок отправлен", callback_data=f"gift_sent_{draw_result.id}")
-                    keyboard.button(text="📦 Подарок получен", callback_data=f"gift_delivered_{draw_result.id}")
+        keyboard.button(text="📦 Создать группу", callback_data="create_group_init")
+        keyboard.button(text="🔗 Присоединиться", callback_data="join_group_init")
+        keyboard.adjust(1)
 
-                    await message.answer(response, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-                    return
+        await message.answer(response, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
 
-        await message.answer(response, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("group_"))
+async def group_detail(callback: types.CallbackQuery):
+    """Show group details"""
+    group_id = int(callback.data.split("_")[1])
+
+    async with get_db_session() as session:
+        group = await get_group(session, group_id)
+        if not group:
+            await callback.answer("❌ Группа не найдена")
+            return
+
+        # Check if user is in group
+        user = await get_user(session, callback.from_user.id)
+        if not user or not await user_in_group(session, user.id, group.id):
+            await callback.answer("❌ Вы не состоите в этой группе")
+            return
+
+        # Count members
+        result = await session.execute(
+            select(func.count()).select_from(
+                user_group_association
+            ).where(user_group_association.c.group_id == group.id)
+        )
+        member_count = result.scalar()
+
+        # Get active event
+        event = await get_active_event(session, group.id)
+
+        response = f"🎮 **Группа: {group.name}**\n\n"
+        response += f"📝 Описание: {group.description if group.description else 'нет'}\n"
+        response += f"👥 Участников: {member_count}\n"
+        response += f"🔑 Код приглашения: `{group.invite_code}`\n"
+        response += f"👑 Создатель: {group.creator.full_name}\n\n"
+
+        if event:
+            response += f"🎅 **Активное событие:** {event.name}\n"
+            response += f"📅 Статус: {event.status}\n"
+            if event.start_date:
+                response += f"⏰ Начало: {event.start_date.strftime('%d.%m.%Y %H:%M')}\n"
+            if event.end_date:
+                response += f"🏁 Окончание: {event.end_date.strftime('%d.%m.%Y %H:%M')}\n"
+
+        keyboard = InlineKeyboardBuilder()
+
+        # Different buttons for admin and regular members
+        if group.creator_id == user.id or user.is_global_admin:
+            keyboard.button(text="⚙️ Управление группой", callback_data=f"manage_group_{group.id}")
+            keyboard.button(text="👥 Участники", callback_data=f"group_members_{group.id}")
+            keyboard.button(text="🎲 Запустить жеребьевку", callback_data=f"start_draw_{group.id}")
+            keyboard.button(text="📅 Установить даты", callback_data=f"set_dates_{group.id}")
+        else:
+            keyboard.button(text="👥 Участники", callback_data=f"group_members_{group.id}")
+            keyboard.button(text="📊 Статистика", callback_data=f"group_stats_{group.id}")
+
+        keyboard.button(text="◀️ Назад к группам", callback_data="back_to_groups")
+        keyboard.adjust(2)
+
+        await callback.message.edit_text(
+            response,
+            reply_markup=keyboard.as_markup(),
+            parse_mode="Markdown"
+        )
+
+    await callback.answer()
 
 
 # ==================== ADMIN COMMANDS ====================
@@ -289,6 +578,7 @@ async def cmd_admin(message: types.Message):
     keyboard.button(text="📊 Статистика", callback_data="admin_stats")
     keyboard.button(text="📢 Рассылка", callback_data="admin_broadcast")
     keyboard.button(text="🔍 Найти пару", callback_data="admin_find_pair")
+    keyboard.button(text="📦 Группы", callback_data="admin_groups")
     keyboard.adjust(2)
 
     await message.answer(
@@ -299,336 +589,37 @@ async def cmd_admin(message: types.Message):
     )
 
 
-@dp.callback_query(F.data == "admin_view_users")
-async def admin_view_users(callback: types.CallbackQuery):
-    """View all registered users"""
+@dp.callback_query(F.data == "admin_groups")
+async def admin_groups_list(callback: types.CallbackQuery):
+    """Show all groups for admin"""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет прав!")
         return
 
-    async with get_async_db() as session:
-        result = await session.execute(select(User))
-        users = result.scalars().all()
+    async with get_db_session() as session:
+        result = await session.execute(select(Group))
+        groups = result.scalars().all()
 
-        response = "👥 **Список участников**\n\n"
-        for i, user in enumerate(users, 1):
-            response += f"{i}. {user.full_name}"
-            if user.username:
-                response += f" (@{user.username})"
-            response += f"\n   ID: {user.telegram_id}"
-            if user.is_banned:
-                response += " 🚫"
-            response += "\n\n"
-
-        await callback.message.edit_text(
-            response,
-            parse_mode="Markdown"
-        )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admin_set_dates")
-async def admin_set_dates(callback: types.CallbackQuery, state: FSMContext):
-    """Set event dates"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет прав!")
-        return
-
-    await callback.message.answer(
-        "📅 **Установка дат**\n\n"
-        "Введите дату начала игры в формате ДД.ММ.ГГГГ ЧЧ:ММ\n"
-        "Пример: 20.12.2024 18:00\n\n"
-        "Или отправьте '-' для использования текущей даты."
-    )
-    await state.set_state(AdminStates.setting_start_date)
-    await callback.answer()
-
-
-@dp.message(AdminStates.setting_start_date)
-async def process_start_date(message: types.Message, state: FSMContext):
-    """Process start date"""
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Нет прав!")
-        await state.clear()
-        return
-
-    async with get_async_db() as session:
-        event = await get_active_event(session)
-
-        if not event:
-            await message.answer("❌ Нет активного события. Создайте группу сначала.")
-            await state.clear()
-            return
-
-        if message.text == '-':
-            event.start_date = datetime.now(pytz.timezone(TIMEZONE))
-        else:
-            try:
-                date_obj = datetime.strptime(message.text, '%d.%m.%Y %H:%M')
-                date_obj = pytz.timezone(TIMEZONE).localize(date_obj)
-                event.start_date = date_obj
-            except ValueError:
-                await message.answer("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ ЧЧ:ММ")
-                return
-
-        await session.commit()
-
-        await message.answer(
-            f"✅ Дата начала установлена: {event.start_date.strftime('%d.%m.%Y %H:%M')}\n\n"
-            "Теперь введите дату окончания игры в том же формате:"
-        )
-        await state.set_state(AdminStates.setting_end_date)
-
-
-@dp.message(AdminStates.setting_end_date)
-async def process_end_date(message: types.Message, state: FSMContext):
-    """Process end date"""
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Нет прав!")
-        await state.clear()
-        return
-
-    async with get_async_db() as session:
-        event = await get_active_event(session)
-
-        if not event:
-            await message.answer("❌ Нет активного события.")
-            await state.clear()
-            return
-
-        if message.text == '-':
-            event.end_date = datetime.now(pytz.timezone(TIMEZONE)) + timedelta(days=7)
-        else:
-            try:
-                date_obj = datetime.strptime(message.text, '%d.%m.%Y %H:%M')
-                date_obj = pytz.timezone(TIMEZONE).localize(date_obj)
-
-                if event.start_date and date_obj <= event.start_date:
-                    await message.answer("❌ Дата окончания должна быть позже даты начала!")
-                    return
-
-                event.end_date = date_obj
-            except ValueError:
-                await message.answer("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ ЧЧ:ММ")
-                return
-
-        await session.commit()
-
-        # Schedule reminders
-        await schedule_reminders(event)
-
-        await message.answer(
-            f"✅ Даты установлены успешно!\n\n"
-            f"• Начало: {event.start_date.strftime('%d.%m.%Y %H:%M')}\n"
-            f"• Окончание: {event.end_date.strftime('%d.%m.%Y %H:%M')}\n\n"
-            f"Напоминания будут отправлены автоматически."
-        )
-
-    await state.clear()
-
-
-@dp.callback_query(F.data == "admin_start_draw")
-async def admin_start_draw(callback: types.CallbackQuery):
-    """Start the draw/raffle"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет прав!")
-        return
-
-    async with get_async_db() as session:
-        event = await get_active_event(session)
-
-        if not event:
-            await callback.message.answer("❌ Нет активного события.")
+        if not groups:
+            await callback.message.answer("❌ Нет созданных групп")
             await callback.answer()
             return
 
-        if not event.start_date or not event.end_date:
-            await callback.message.answer("❌ Сначала установите даты начала и окончания.")
-            await callback.answer()
-            return
+        response = "📦 **Все группы:**\n\n"
 
-        # Get all users from the event's group
-        result = await session.execute(
-            select(User).join(
-                UserGroupAssociation, User.id == UserGroupAssociation.c.user_id
-            ).join(
-                Group, Group.id == UserGroupAssociation.c.group_id
-            ).where(Group.id == event.group_id)
-        )
-        participants = result.scalars().all()
-
-        if len(participants) < 3:
-            await callback.message.answer(f"❌ Недостаточно участников. Нужно минимум 3, а у вас {len(participants)}.")
-            await callback.answer()
-            return
-
-        # Perform the draw
-        success = await perform_draw(session, event, participants)
-
-        if success:
-            event.status = 'active'
-            await session.commit()
-
-            # Notify participants
-            await notify_participants(session, event)
-
-            await callback.message.answer(
-                f"✅ Жеребьевка успешно проведена!\n\n"
-                f"Участников: {len(participants)}\n"
-                f"Все участники уведомлены о своих получателях."
-            )
-        else:
-            await callback.message.answer("❌ Ошибка при проведении жеребьевки.")
-
-    await callback.answer()
-
-
-async def perform_draw(session: AsyncSession, event: Event, participants: list) -> bool:
-    """Perform the secret santa draw"""
-    try:
-        # Clear previous results
-        await session.execute(delete(DrawResult).where(DrawResult.event_id == event.id))
-
-        # Create a copy and shuffle
-        receivers = participants.copy()
-        random.shuffle(receivers)
-
-        # Ensure no one gets themselves and create a proper chain
-        max_attempts = 100
-        for attempt in range(max_attempts):
-            valid = True
-            random.shuffle(receivers)
-
-            for i in range(len(participants)):
-                if participants[i].id == receivers[i].id:
-                    valid = False
-                    break
-
-            if valid:
-                break
-
-        if not valid:
-            # If still not valid after attempts, adjust manually
-            for i in range(len(participants)):
-                if participants[i].id == receivers[i].id:
-                    # Swap with next participant
-                    next_idx = (i + 1) % len(participants)
-                    receivers[i], receivers[next_idx] = receivers[next_idx], receivers[i]
-
-        # Create draw results
-        for santa, receiver in zip(participants, receivers):
-            draw_result = DrawResult(
-                event_id=event.id,
-                santa_id=santa.id,
-                receiver_id=receiver.id
-            )
-            session.add(draw_result)
-
-        await session.commit()
-        return True
-
-    except Exception as e:
-        logger.error(f"Error in perform_draw: {e}")
-        await session.rollback()
-        return False
-
-
-async def notify_participants(session: AsyncSession, event: Event):
-    """Notify all participants about their draw results"""
-    result = await session.execute(
-        select(DrawResult).where(DrawResult.event_id == event.id)
-    )
-    draw_results = result.scalars().all()
-
-    for draw in draw_results:
-        santa = await session.get(User, draw.santa_id)
-        receiver = await session.get(User, draw.receiver_id)
-
-        if santa and receiver:
-            message = (
-                f"🎅 **Поздравляю, вы - Тайный Санта!**\n\n"
-                f"🎁 **Вы дарите подарок:** {receiver.full_name}\n\n"
-                f"📝 **Пожелания получателя:**\n{receiver.wishlist}\n\n"
-                f"📅 **Срок до:** {event.end_date.strftime('%d.%m.%Y')}\n\n"
-                f"🎄 **Советы:**\n"
-                f"• Сохраняйте интригу до конца игры\n"
-                f"• Подтвердите отправку подарка в профиле\n"
-                f"• Не раскрывайте свою личность!"
-            )
-
-            try:
-                await bot.send_message(
-                    chat_id=santa.telegram_id,
-                    text=message,
-                    parse_mode="Markdown"
-                )
-                draw.notified = True
-            except Exception as e:
-                logger.error(f"Failed to notify user {santa.telegram_id}: {e}")
-
-    await session.commit()
-
-
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: types.CallbackQuery):
-    """Show statistics"""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет прав!")
-        return
-
-    async with get_async_db() as session:
-        # Count users
-        total_users = await session.scalar(select(func.count()).select_from(User))
-        active_users = await session.scalar(
-            select(func.count()).select_from(User).where(
-                User.last_activity >= datetime.now(pytz.timezone(TIMEZONE)) - timedelta(days=7)
-            )
-        )
-
-        # Get active event
-        event = await get_active_event(session)
-
-        response = "📊 **Статистика**\n\n"
-        response += f"• Всего пользователей: {total_users}\n"
-        response += f"• Активных (за 7 дней): {active_users}\n"
-
-        if event:
-            # Count participants in this event
+        for group in groups:
+            # Count members
             result = await session.execute(
-                select(func.count()).select_from(DrawResult).where(
-                    DrawResult.event_id == event.id
-                )
+                select(func.count()).select_from(
+                    user_group_association
+                ).where(user_group_association.c.group_id == group.id)
             )
-            total_pairs = result.scalar() or 0
+            member_count = result.scalar()
 
-            result = await session.execute(
-                select(func.count()).select_from(DrawResult).where(
-                    DrawResult.event_id == event.id,
-                    DrawResult.gift_sent == True
-                )
-            )
-            gifts_sent = result.scalar() or 0
-
-            result = await session.execute(
-                select(func.count()).select_from(DrawResult).where(
-                    DrawResult.event_id == event.id,
-                    DrawResult.gift_delivered == True
-                )
-            )
-            gifts_delivered = result.scalar() or 0
-
-            response += f"\n🎮 **Текущая игра:** {event.name}\n"
-            response += f"• Статус: {event.status}\n"
-            response += f"• Участников: {total_pairs}\n"
-            response += f"• Подарков отправлено: {gifts_sent}/{total_pairs}\n"
-            response += f"• Подарков получено: {gifts_delivered}/{total_pairs}\n"
-
-            if event.start_date:
-                response += f"• Начало: {event.start_date.strftime('%d.%m.%Y')}\n"
-            if event.end_date:
-                days_left = (event.end_date - datetime.now(pytz.timezone(TIMEZONE))).days
-                response += f"• Окончание через: {days_left} дней\n"
+            response += f"🎮 *{group.name}*\n"
+            response += f"   👥 Участников: {member_count}\n"
+            response += f"   🔑 Код: `{group.invite_code}`\n"
+            response += f"   👑 Создатель: {group.creator.full_name}\n\n"
 
         await callback.message.edit_text(response, parse_mode="Markdown")
 
@@ -638,7 +629,7 @@ async def admin_stats(callback: types.CallbackQuery):
 # ==================== SCHEDULER FUNCTIONS ====================
 
 async def schedule_reminders(event: Event):
-    """Schedule reminder notifications"""
+    """Schedule reminder notifications for event"""
     if not event.start_date or not event.end_date:
         return
 
@@ -694,7 +685,7 @@ async def schedule_reminders(event: Event):
 
 async def send_reminder(event_id: int, reminder_type: str):
     """Send reminder to all participants"""
-    async with get_async_db() as session:
+    async with get_db_session() as session:
         event = await session.get(Event, event_id)
         if not event:
             return
@@ -702,8 +693,8 @@ async def send_reminder(event_id: int, reminder_type: str):
         # Get all participants in the event's group
         result = await session.execute(
             select(User).join(
-                UserGroupAssociation, User.id == UserGroupAssociation.c.user_id
-            ).where(UserGroupAssociation.c.group_id == event.group_id)
+                user_group_association, User.id == user_group_association.c.user_id
+            ).where(user_group_association.c.group_id == event.group_id)
         )
         participants = result.scalars().all()
 
@@ -749,21 +740,6 @@ async def on_startup():
 
     # Start scheduler
     scheduler.start()
-
-    # TODO: временно отключено - будет добавлено позже
-    # Планировщик работает, но без проверки существующих событий
-
-    # # Schedule existing events using new session manager
-    # from database import get_db_session
-    # async with get_db_session() as session:
-    #     result = await session.execute(
-    #         select(Event).where(Event.status.in_(['waiting', 'active']))
-    #     )
-    #     events = result.scalars().all()
-    #
-    #     for event in events:
-    #         if event.start_date and event.end_date:
-    #             await schedule_reminders(event)
 
     # Notify admin
     try:
