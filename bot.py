@@ -1,143 +1,92 @@
-# Изменения в импортах
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, delete, and_, or_, func
-from sqlalchemy.orm import selectinload, joinedload
-from sqlalchemy import text
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-import pytz
+from config import BOT_TOKEN, ADMIN_ID
 
-from config import BOT_TOKEN, ADMIN_ID, TIMEZONE
-from database import get_async_db, User, Group, Event, DrawResult, AnonymousMessage, Feedback, InviteCode, \
-    AdminNotification, ExclusionRule, ActivityLog, UserGroupAssociation
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Пример асинхронных запросов к PostgreSQL
-async def get_user_by_telegram_id(session: AsyncSession, telegram_id: int) -> Optional[User]:
-    """Асинхронное получение пользователя по Telegram ID"""
-    result = await session.execute(
-        select(User)
-        .where(User.telegram_id == telegram_id)
-        .options(selectinload(User.groups))
+# Initialize bot
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "🎅 Добро пожаловать в Тайного Санту!\n\n"
+        "Используйте команды:\n"
+        "/register - регистрация в игре\n"
+        "/help - помощь\n"
+        "/admin - панель управления (только для администратора)"
     )
-    return result.scalar_one_or_none()
 
 
-async def get_group_with_members(session: AsyncSession, group_id: int) -> Optional[Group]:
-    """Асинхронное получение группы с участниками"""
-    result = await session.execute(
-        select(Group)
-        .where(Group.id == group_id)
-        .options(
-            selectinload(Group.members),
-            selectinload(Group.creator),
-            selectinload(Group.events)
+@dp.message(Command("register"))
+async def cmd_register(message: types.Message):
+    await message.answer(
+        "Для регистрации напишите:\n"
+        "1. Ваше ФИО\n"
+        "2. Ваши пожелания к подарку\n\n"
+        "Пример:\n"
+        "Иванов Иван Иванович\n"
+        "Хочу книгу по программированию"
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "🎅 Тайный Санта - помощь:\n\n"
+        "/start - начать работу с ботом\n"
+        "/register - зарегистрироваться в игре\n"
+        "/admin - панель администратора\n\n"
+        "По вопросам пишите организатору."
+    )
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    # Check if user is admin
+    if str(message.from_user.id) == ADMIN_ID:
+        await message.answer(
+            "👑 Панель администратора\n\n"
+            "Вы администратор этого бота!\n"
+            "Доступные функции:\n"
+            "• Управление участниками\n"
+            "• Запуск жеребьевки\n"
+            "• Настройка дат\n"
+            "• Просмотр статистики"
         )
-    )
-    return result.scalar_one_or_none()
+    else:
+        await message.answer("⛔ У вас нет прав администратора!")
 
 
-async def create_new_user(session: AsyncSession, user_data: Dict[str, Any]) -> User:
-    """Асинхронное создание нового пользователя"""
-    new_user = User(
-        telegram_id=user_data['telegram_id'],
-        username=user_data.get('username'),
-        full_name=user_data['full_name'],
-        wishlist=user_data['wishlist'],
-        is_admin=(str(user_data['telegram_id']) == ADMIN_ID)
-    )
-    session.add(new_user)
-    await session.commit()
-    await session.refresh(new_user)
-    return new_user
+@dp.message(F.text)
+async def handle_text(message: types.Message):
+    # Simple echo for testing
+    if message.text.lower() == "привет":
+        await message.answer(f"Привет, {message.from_user.first_name}!")
 
 
-async def perform_draw_async(session: AsyncSession, event: Event) -> bool:
-    """Асинхронная жеребьевка с использованием PostgreSQL функций"""
+async def main():
+    logger.info("Starting bot...")
+
+    # Test bot connection
     try:
-        # Получаем всех участников группы
-        group = await session.get(Group, event.group_id, options=[selectinload(Group.members)])
-
-        if not group or len(group.members) < 3:
-            return False
-
-        participants = group.members
-
-        # Удаляем старые результаты
-        await session.execute(
-            delete(DrawResult).where(DrawResult.event_id == event.id)
-        )
-
-        # Получаем правила исключений
-        exclusions_result = await session.execute(
-            select(ExclusionRule).where(ExclusionRule.event_id == event.id)
-        )
-        exclusions = exclusions_result.scalars().all()
-
-        # Создаем список для распределения
-        receivers = participants.copy()
-        import random
-        random.shuffle(receivers)
-
-        # Создаем пары с учетом исключений
-        pairs = []
-        max_attempts = 100
-
-        for attempt in range(max_attempts):
-            random.shuffle(receivers)
-            valid = True
-            pairs = []
-
-            for i, santa in enumerate(participants):
-                receiver = receivers[i]
-
-                # Проверка исключений
-                if any(
-                        (excl.user1_id == santa.id and excl.user2_id == receiver.id) or
-                        (excl.rule_type == 'mutual' and excl.user2_id == santa.id and excl.user1_id == receiver.id)
-                        for excl in exclusions
-                ):
-                    valid = False
-                    break
-
-                # Проверка на самоподарок
-                if santa.id == receiver.id:
-                    valid = False
-                    break
-
-                pairs.append((santa.id, receiver.id))
-
-            if valid:
-                break
-
-        if not valid:
-            return False
-
-        # Сохраняем результаты в БД
-        for santa_id, receiver_id in pairs:
-            draw_result = DrawResult(
-                event_id=event.id,
-                santa_id=santa_id,
-                receiver_id=receiver_id
-            )
-            session.add(draw_result)
-
-        await session.commit()
-        return True
-
+        me = await bot.get_me()
+        logger.info(f"Bot started: @{me.username}")
     except Exception as e:
-        logging.error(f"Error in perform_draw_async: {e}")
-        await session.rollback()
-        return False
+        logger.error(f"Failed to start bot: {e}")
+        return
 
-# ... остальной код адаптировать аналогичным образом ...
+    # Start polling
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
