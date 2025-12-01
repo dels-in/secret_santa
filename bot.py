@@ -751,7 +751,6 @@ async def on_startup():
         logger.error(f"Failed to notify admin: {e}")
 
 
-
 async def on_shutdown():
     """Actions on bot shutdown"""
     logger.info("Bot shutting down...")
