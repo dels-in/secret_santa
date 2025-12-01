@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Table, UniqueConstraint, \
-    BigInteger, Index, CheckConstraint, func
+    BigInteger, Index, CheckConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy import text
@@ -8,9 +8,23 @@ import pytz
 import secrets
 import string
 from typing import AsyncGenerator
-from contextlib import asynccontextmanager
 
 from config import DATABASE_URL, SYNC_DATABASE_URL, TIMEZONE
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def get_db_session():
+    """Async context manager for database sessions"""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
 
 # Async engine for main application
 async_engine = create_async_engine(DATABASE_URL, echo=False)
@@ -60,6 +74,11 @@ class User(Base):
     sent_messages = relationship('AnonymousMessage', foreign_keys='AnonymousMessage.sender_id', back_populates='sender')
     received_messages = relationship('AnonymousMessage', foreign_keys='AnonymousMessage.receiver_id',
                                      back_populates='receiver')
+    feedbacks_given = relationship('Feedback', foreign_keys='Feedback.giver_id', back_populates='giver')
+    feedbacks_received = relationship('Feedback', foreign_keys='Feedback.receiver_id', back_populates='receiver')
+    created_invites = relationship('InviteCode', back_populates='creator')
+    # admin_notifications = relationship('AdminNotification', foreign_keys='AdminNotification.user_id',
+    #                                    back_populates='user')
 
 
 class Group(Base):
@@ -82,6 +101,7 @@ class Group(Base):
     events = relationship("Event", back_populates="group")
     invites = relationship('InviteCode', back_populates='group')
     anonymous_messages = relationship('AnonymousMessage', back_populates='group')
+    # admin_notifications = relationship('AdminNotification', back_populates='group')
 
 
 class Event(Base):
@@ -92,14 +112,15 @@ class Event(Base):
     group_id = Column(Integer, ForeignKey('groups.id', ondelete='CASCADE'), nullable=False)
     start_date = Column(DateTime(timezone=True), nullable=True)
     end_date = Column(DateTime(timezone=True), nullable=True)
-    status = Column(String(20), default='waiting', nullable=False)
+    status = Column(String(20), default='waiting', nullable=False)  # waiting, active, finished, cancelled
     price_limit = Column(String(100), nullable=True)
-    draw_method = Column(String(20), default='auto', nullable=False)
+    draw_method = Column(String(20), default='auto', nullable=False)  # auto, manual, hybrid
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
 
     # Relationships
     group = relationship("Group", back_populates="events")
     results = relationship('DrawResult', back_populates='event')
+    feedbacks = relationship('Feedback', back_populates='event')
     exclusion_rules = relationship('ExclusionRule', back_populates='event')
 
 
@@ -137,7 +158,7 @@ class ExclusionRule(Base):
     event_id = Column(Integer, ForeignKey('events.id', ondelete='CASCADE'), nullable=False)
     user1_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
     user2_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    rule_type = Column(String(20), default='mutual', nullable=False)
+    rule_type = Column(String(20), default='mutual', nullable=False)  # mutual, directional
     reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
 
@@ -170,6 +191,29 @@ class AnonymousMessage(Base):
     group = relationship("Group", back_populates="anonymous_messages")
 
 
+class Feedback(Base):
+    __tablename__ = 'feedbacks'
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey('events.id', ondelete='CASCADE'), nullable=False)
+    giver_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    receiver_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    rating = Column(Integer, nullable=False)  # 1-5 stars
+    comment = Column(Text, nullable=True)
+    is_anonymous = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
+
+    # Relationships
+    event = relationship('Event', back_populates='feedbacks')
+    giver = relationship('User', foreign_keys=[giver_id], back_populates='feedbacks_given')
+    receiver = relationship('User', foreign_keys=[receiver_id], back_populates='feedbacks_received')
+
+    __table_args__ = (
+        UniqueConstraint('event_id', 'giver_id', 'receiver_id', name='unique_feedback'),
+        CheckConstraint('rating >= 1 AND rating <= 5', name='rating_range'),
+    )
+
+
 class InviteCode(Base):
     __tablename__ = 'invite_codes'
 
@@ -185,26 +229,35 @@ class InviteCode(Base):
 
     # Relationships
     group = relationship("Group", back_populates="invites")
-    creator = relationship("User")
+    creator = relationship("User", back_populates="created_invites")
 
 
-# Context manager for async sessions
-@asynccontextmanager
-async def get_db_session():
-    """Async context manager for database sessions"""
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+class AdminNotification(Base):
+    __tablename__ = 'admin_notifications'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    group_id = Column(Integer, ForeignKey('groups.id', ondelete='CASCADE'), nullable=False)
+    message = Column(Text, nullable=False)
+    is_resolved = Column(Boolean, default=False, nullable=False)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_by = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
+
+    # Явно указываем foreign_keys для устранения неоднозначности
+    user = relationship("User", foreign_keys=[user_id], backref="admin_notifications_received")
+    group = relationship("Group", backref="admin_notifications")
+    resolver = relationship("User", foreign_keys=[resolved_by], backref="admin_notifications_resolved")
+
+    __table_args__ = (
+        Index('idx_notifications_user', 'user_id'),
+        Index('idx_notifications_group', 'group_id'),
+        Index('idx_notifications_resolved', 'is_resolved'),
+        Index('idx_notifications_created', 'created_at'),
+    )
 
 
 async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
-    """Async database session generator"""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -213,12 +266,11 @@ async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 def generate_invite_code(length=8) -> str:
-    """Generate unique invite code"""
     alphabet = string.ascii_uppercase + string.digits
     while True:
         code = ''.join(secrets.choice(alphabet) for _ in range(length))
         db = SyncSessionLocal()
-        existing = db.query(Group).filter(Group.invite_code == code).first()
+        existing = db.query(InviteCode).filter_by(code=code).first()
         db.close()
         if not existing:
             return code
@@ -226,3 +278,14 @@ def generate_invite_code(length=8) -> str:
 
 # Create tables
 Base.metadata.create_all(bind=sync_engine)
+
+# Экспортируем ассоциативную таблицу для импорта
+user_group_association = UserGroupAssociation = user_group_association
+
+# Создаем псевдоним для удобства импорта
+__all__ = [
+    'Base', 'User', 'Group', 'Event', 'DrawResult', 'ExclusionRule',
+    'AnonymousMessage', 'Feedback', 'InviteCode', 'AdminNotification',
+    'user_group_association', 'UserGroupAssociation',
+    'get_async_db', 'generate_invite_code'
+]

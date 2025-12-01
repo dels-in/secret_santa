@@ -1,14 +1,12 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, Table, UniqueConstraint, \
-    BigInteger, Index, CheckConstraint, func
+    BigInteger, Index, CheckConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from sqlalchemy import text
 from datetime import datetime
 import pytz
 import secrets
 import string
 from typing import AsyncGenerator
-from contextlib import asynccontextmanager
 
 from config import DATABASE_URL, SYNC_DATABASE_URL, TIMEZONE
 
@@ -52,14 +50,11 @@ class User(Base):
     last_activity = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
     registered_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
 
-    # Relationships
+    # Relationships (упрощенные)
     groups = relationship("Group", secondary=user_group_association, back_populates="members")
     created_groups = relationship("Group", back_populates="creator")
     as_santa = relationship('DrawResult', foreign_keys='DrawResult.santa_id', back_populates='santa')
     as_receiver = relationship('DrawResult', foreign_keys='DrawResult.receiver_id', back_populates='receiver')
-    sent_messages = relationship('AnonymousMessage', foreign_keys='AnonymousMessage.sender_id', back_populates='sender')
-    received_messages = relationship('AnonymousMessage', foreign_keys='AnonymousMessage.receiver_id',
-                                     back_populates='receiver')
 
 
 class Group(Base):
@@ -80,8 +75,6 @@ class Group(Base):
     creator = relationship("User", back_populates="created_groups")
     members = relationship("User", secondary=user_group_association, back_populates="groups")
     events = relationship("Event", back_populates="group")
-    invites = relationship('InviteCode', back_populates='group')
-    anonymous_messages = relationship('AnonymousMessage', back_populates='group')
 
 
 class Event(Base):
@@ -100,7 +93,6 @@ class Event(Base):
     # Relationships
     group = relationship("Group", back_populates="events")
     results = relationship('DrawResult', back_populates='event')
-    exclusion_rules = relationship('ExclusionRule', back_populates='event')
 
 
 class DrawResult(Base):
@@ -130,81 +122,10 @@ class DrawResult(Base):
     )
 
 
-class ExclusionRule(Base):
-    __tablename__ = 'exclusion_rules'
-
-    id = Column(Integer, primary_key=True, index=True)
-    event_id = Column(Integer, ForeignKey('events.id', ondelete='CASCADE'), nullable=False)
-    user1_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    user2_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    rule_type = Column(String(20), default='mutual', nullable=False)
-    reason = Column(Text, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
-
-    # Relationships
-    event = relationship("Event", back_populates="exclusion_rules")
-    user1 = relationship("User", foreign_keys=[user1_id])
-    user2 = relationship("User", foreign_keys=[user2_id])
-
-    __table_args__ = (
-        UniqueConstraint('event_id', 'user1_id', 'user2_id', name='unique_exclusion'),
-        CheckConstraint("rule_type IN ('mutual', 'directional')", name='valid_rule_type'),
-        CheckConstraint('user1_id != user2_id', name='different_users'),
-    )
-
-
-class AnonymousMessage(Base):
-    __tablename__ = 'anonymous_messages'
-
-    id = Column(Integer, primary_key=True, index=True)
-    sender_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    receiver_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    group_id = Column(Integer, ForeignKey('groups.id', ondelete='CASCADE'), nullable=False)
-    message = Column(Text, nullable=False)
-    is_read = Column(Boolean, default=False, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
-
-    # Relationships
-    sender = relationship('User', foreign_keys=[sender_id], back_populates='sent_messages')
-    receiver = relationship('User', foreign_keys=[receiver_id], back_populates='received_messages')
-    group = relationship("Group", back_populates="anonymous_messages")
-
-
-class InviteCode(Base):
-    __tablename__ = 'invite_codes'
-
-    id = Column(Integer, primary_key=True, index=True)
-    code = Column(String(10), unique=True, index=True, nullable=False)
-    group_id = Column(Integer, ForeignKey('groups.id', ondelete='CASCADE'), nullable=False)
-    created_by = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
-    max_uses = Column(Integer, default=1, nullable=False)
-    used_count = Column(Integer, default=0, nullable=False)
-    expires_at = Column(DateTime(timezone=True), nullable=True)
-    is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(pytz.timezone(TIMEZONE)))
-
-    # Relationships
-    group = relationship("Group", back_populates="invites")
-    creator = relationship("User")
-
-
-# Context manager for async sessions
-@asynccontextmanager
-async def get_db_session():
-    """Async context manager for database sessions"""
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
-
+# Упрощаем - временно убираем сложные модели
+# class AnonymousMessage, Feedback, InviteCode, ExclusionRule, AdminNotification
 
 async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
-    """Async database session generator"""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -213,7 +134,6 @@ async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 def generate_invite_code(length=8) -> str:
-    """Generate unique invite code"""
     alphabet = string.ascii_uppercase + string.digits
     while True:
         code = ''.join(secrets.choice(alphabet) for _ in range(length))

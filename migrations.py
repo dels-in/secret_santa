@@ -19,7 +19,7 @@ def init_database():
         print("✅ Таблицы успешно созданы")
 
         # Create PostgreSQL extensions if needed
-        with sync_engine.begin() as conn:  # CHANGED: connect() -> begin()
+        with sync_engine.begin() as conn:
             # Enable UUID extension if you plan to use it
             # conn.execute(text("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"))
             pass
