@@ -51,6 +51,9 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
+    # ВРЕМЕННО: отладка
+    print(f"DEBUG: Ваш ID: {message.from_user.id}, ADMIN_ID из .env: {ADMIN_ID}")
+    print(f"DEBUG: Сравнение: {message.from_user.id} == {ADMIN_ID} = {message.from_user.id == ADMIN_ID}")
     # Check if user is admin
     if str(message.from_user.id) == ADMIN_ID:
         await message.answer(
