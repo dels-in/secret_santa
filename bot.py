@@ -20,10 +20,6 @@ import pytz
 from config import BOT_TOKEN, ADMIN_ID, TIMEZONE
 from database import get_async_db, User, Group, Event, DrawResult, AnonymousMessage, Feedback, InviteCode, \
     AdminNotification, ExclusionRule, ActivityLog, UserGroupAssociation
-from security import SecurityManager
-
-
-# ... остальной код остается похожим, но с async/await ...
 
 # Пример асинхронных запросов к PostgreSQL
 async def get_user_by_telegram_id(session: AsyncSession, telegram_id: int) -> Optional[User]:

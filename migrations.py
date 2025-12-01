@@ -67,8 +67,8 @@ def run_migrations():
     if not init_database():
         return False
 
-    # 2. Создание партиций
-    create_partitions()
+    # 2. Создание партиций - временно отключено
+    ## create_partitions()
 
     # 3. Добавление тестовых данных (опционально)
     if len(sys.argv) > 1 and sys.argv[1] == "--test-data":
