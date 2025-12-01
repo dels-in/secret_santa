@@ -42,20 +42,25 @@ async def test_bot():
     # 4. Тест подключения к БД
     print(f"4. Тест подключения к БД...")
     try:
-        from sqlalchemy.ext.asyncio import create_async_engine
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy import text  # ИМЕННО ЭТОТ ИМПОРТ НУЖЕН!
         from config import DATABASE_URL
 
         engine = create_async_engine(DATABASE_URL, echo=False)
         async with engine.connect() as conn:
-            await conn.execute("SELECT 1")
-            print("   Подключение к БД... OK")
+            # ИСПРАВЛЕННАЯ СТРОКА: используем text() для SQL-запросов
+            result = await conn.execute(text("SELECT 1"))
+            row = result.fetchone()
+            if row and row[0] == 1:
+                print("   Подключение к БД... OK")
+            else:
+                print("   ❌ Неожиданный результат от БД")
     except Exception as e:
         print(f"   ❌ Ошибка подключения к БД: {e}")
+        print(f"   Подробности: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
         return False
-
-    print("=== ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ ===")
-    print("Бот должен работать. Пробуем запустить...")
-    return True
 
 
 if __name__ == "__main__":
