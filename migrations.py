@@ -12,7 +12,6 @@ from config import SYNC_DATABASE_URL
 
 
 def init_database():
-    """Инициализация базы данных и создание таблиц"""
     print("🔄 Инициализация базы данных PostgreSQL...")
 
     try:
@@ -21,14 +20,14 @@ def init_database():
         print("✅ Таблицы успешно созданы")
 
         # Создаем расширения PostgreSQL если нужно
-        with sync_engine.connect() as conn:
-            # Включаем расширение для UUID если планируете использовать
-            # conn.execute(text("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"))
+        with sync_engine.begin() as conn:  # ИЗМЕНИЛИ connect() на begin()
+        # Включаем расширение для UUID если планируете использовать
+        # conn.execute(text("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"))
 
-            # Создаем индексы для полнотекстового поиска если нужно
-            # conn.execute(text("CREATE INDEX idx_users_full_name_gin ON users USING gin(to_tsvector('russian', full_name));"))
+        # Создаем индексы для полнотекстового поиска если нужно
+        conn.execute(text("CREATE INDEX idx_users_full_name_gin ON users USING gin(to_tsvector('russian', full_name));"))
 
-            conn.commit()
+        # НЕ НУЖНО вызывать conn.commit() - begin() делает это автоматически
 
         print("✅ База данных успешно инициализирована")
         return True
@@ -43,14 +42,14 @@ def create_partitions():
     print("🔄 Создание партиций для больших таблиц...")
 
     try:
-        with sync_engine.connect() as conn:
-            # Партицирование логов активности по месяцам
+        with sync_engine.begin() as conn:  # ИЗМЕНИТЕ connect() на begin()
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS activity_logs_2024_01 PARTITION OF activity_logs
                 FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
             """))
 
-            conn.commit()
+            # НЕ НУЖНО conn.commit()
+
         print("✅ Партиции созданы")
         return True
 
