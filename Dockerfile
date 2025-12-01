@@ -10,6 +10,9 @@ COPY requirements.txt .
 # Устанавливаем зависимости Python
 RUN pip install --no-cache-dir -r requirements.txt
 
+# В Dockerfile, после RUN pip install...
+RUN pip install sqlalchemy==1.4.46  # Старая версия, где работает без text()
+
 # Копируем весь код проекта
 COPY . .
 
